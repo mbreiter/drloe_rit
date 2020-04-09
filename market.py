@@ -350,7 +350,7 @@ class RITEnvironment(gym.Env):
 
     def _get_ohlc(self):
         params = {'ticker': self.ticker}
-        resp = s.get(self.api.format('securities/tas'), params=params)
+        resp = s.get(self.api.format('securities/history'), params=params)
 
         if resp.ok:
             ohlc = pd.DataFrame(resp.json()).set_index('tick')[::-1]
