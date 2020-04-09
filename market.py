@@ -1,7 +1,7 @@
 ''' gym environment for Rotman's RIT client '''
 __author__ = 'Matthew Reiter'
 __email__ = 'matthew.reiter@mail.utoronto.ca'
-__version__ = '1.0.1'
+__version__ = '2.0.1'
 __status__ = 'Production'
 __copyright__   = 'Copyright 2020, Applications of Deep Reinforcement Learning, BASc Thesis, University of Toronto'
 
@@ -21,6 +21,7 @@ OH_COLS = ['order_id',          # unique identifier from the matching engine
            'quantity',          # target quantity for limit order
            'filled',            # quantity executed
            'vwap',              # running vwap for the order
+           'vwap_m',            # vwap of the market at the !time of the execution!
            'active']            # False if not filled or cancelled
 
 STATE_COLS = ['time',
@@ -30,7 +31,8 @@ STATE_COLS = ['time',
               'position',
               'pending',
               'cost',
-              'vwap']
+              'vwap',
+              'market_volume']
 
 
 class RITEnvironment(gym.Env):
@@ -69,7 +71,7 @@ class RITEnvironment(gym.Env):
 
         self.inventory, self.direction = params['inventory'], params['direction']
 
-        self.position, self.cost = self._get_position()
+        self.position, self.cost, self.market_volume = self._get_position()
         self.vwap_m = 0
         self.pending, self.pending_orders = self._get_pending()
         self.order_history = pd.DataFrame(columns=OH_COLS)
@@ -87,7 +89,7 @@ class RITEnvironment(gym.Env):
             self.status, self.time, _ = self._get_tick_status()
 
         # reset the position
-        self.position, self.cost = self._get_position()
+        self.position, self.cost, self.market_volume = self._get_position()
         self.vwap_m = self._calc_vwap()
         self.pending, self.pending_orders = self._get_pending()
 
@@ -105,7 +107,8 @@ class RITEnvironment(gym.Env):
                                            self.position,
                                            self.pending,
                                            self.cost,
-                                           self._calc_vwap()]))
+                                           self._calc_vwap(),
+                                           self.market_volume]))
 
         return order_book, state_info
 
@@ -121,7 +124,7 @@ class RITEnvironment(gym.Env):
         # now execute the trade ... will will return 0 reward if the order is not accepted by the matchine engine
         reward += self._execute_trade(action)
 
-        self.position, self.cost = self._get_position()
+        self.position, self.cost, self.market_volume = self._get_position()
         self.vwap_m = self._calc_vwap()
         self.pending, self.pending_orders = self._get_pending()
 
@@ -130,12 +133,10 @@ class RITEnvironment(gym.Env):
 
         # check if we are done
         if self.time >= self.end_time:
-            done, info = True, 'trading is done.\t'
-            info += 'timeout: {}\tinventory met: {}'.format(self.time == self.end_time,
-                                                            self.position == self.inventory)
-            reward += self._calc_reward(self.inventory, self.cost, portion=1, done=True)
+            done, info = True, (self._get_ohlc(), self._get_volume_profile())
+            reward += self._calc_reward(self.position, self.cost, portion=1, done=True)
         else:
-            done, info = False, 'trading continues.'
+            done, info = False, None
 
         return obs, reward, done, info
 
@@ -167,7 +168,7 @@ class RITEnvironment(gym.Env):
                             self._delayed_helper(order), axis=1)
 
         # update our position
-        self.position, self.cost = self._get_position()
+        self.position, self.cost, self.market_volume = self._get_position()
 
     def _execute_trade(self, action):
         trade_type, price, quantity = action[0], action[1], action[2]
@@ -185,8 +186,8 @@ class RITEnvironment(gym.Env):
             self._cancel_orders()
             
             # update the quantity again to ensure that we execute the correct amount
-            self.position, self.cost = self._get_position()
-            quantity = abs(self.inventory - self.position)
+            self.position, self.cost, self.market_volume = self._get_position()
+            quantity = self.inventory - self.position
 
             status, order_id, quantity_filled, vwap_e, tick = self._post_order('MARKET',
                                                                                quantity,
@@ -194,9 +195,12 @@ class RITEnvironment(gym.Env):
                                                                                'SELL' if self.direction == 1 else 'BUY')
         elif trade_type == 2:   # hold
             return 0
-        else:                   # cancel
+        else:                   # cancel outstanding orders
             self._cancel_orders()
             return 0
+
+        # pause to give the order some chance to interact with the market
+        time.sleep(0.25)
 
         if status not in ['failed', 'cancelled']:
             # add the order to the tracking list
@@ -208,17 +212,19 @@ class RITEnvironment(gym.Env):
                                                quantity,
                                                quantity_filled,
                                                vwap_e,
+                                               self._calc_vwap(),
                                                status == 'OPEN']))
             self.order_history = self.order_history.append(order_details, ignore_index=True)
 
             # calculate the reward
-            reward = self._calc_reward(price*quantity, vwap_e, portion=1, done=False)
+            reward = self._calc_reward(quantity_filled, vwap_e, portion=1, done=False)
 
         return reward
 
     def _calc_reward(self, quantity, vwap_e, portion=1, done=False):
         vwap_m, reward = self._calc_vwap(), 0
 
+        # vwap_e would be None if the order has not been executed
         if vwap_e is not None:
             if self.reward_signal['collection'] == 'terminal':
                 reward = quantity * (vwap_e - vwap_m) * self.direction if done else 0
@@ -258,11 +264,11 @@ class RITEnvironment(gym.Env):
 
         if resp.ok:
             securities = resp.json()
-            current_position, cost = abs(securities[0]['position']), securities[0]['vwap']
+            current_position, cost, market_volume = abs(securities[0]['position']), securities[0]['vwap'], securities[0]['volume']
 
-            return current_position, cost
+            return current_position, cost, market_volume
         else:
-            return None, None
+            return 0, 0, 0
 
     def _get_pending(self):
         params = {'status': 'OPEN'}
@@ -319,7 +325,7 @@ class RITEnvironment(gym.Env):
 
         # update the pending trackers and the order history
         self.pending, self.pending_orders = self._get_pending()
-        self.order_history.loc[self.order_history['active'] == True, 'i_cancelled'] = self.time
+        self.order_history.loc[self.order_history['active'], 'i_cancelled'] = self.time
         self.order_history['active'] = False
 
     def _calc_vwap(self):
@@ -341,6 +347,29 @@ class RITEnvironment(gym.Env):
                     return weighted_avg_num / quantity
                 except:
                     return 0
+
+    def _get_ohlc(self):
+        params = {'ticker': self.ticker}
+        resp = s.get(self.api.format('securities/tas'), params=params)
+
+        if resp.ok:
+            ohlc = pd.DataFrame(resp.json()).set_index('tick')[::-1]
+            ohlc.columns = map(str.title, ohlc.columns)
+            ohlc.index.name = 'Tick'
+            ohlc.index = pd.to_datetime(ohlc.index)
+
+            return ohlc
+
+    def _get_volume_profile(self):
+        params = {'ticker': self.ticker}
+        resp = s.get(self.api.format('securities/tas'), params=params)
+
+        if resp.ok:
+            data = pd.DataFrame(resp.json())
+            volume_profile = data.groupby('tick').sum()
+            volume_profile.drop(columns=[col for col in volume_profile if col != 'quantity'], inplace=True)
+
+            return volume_profile.to_dict()['quantity']
 
     def _get_lob(self):
         params = {'ticker': self.ticker}
@@ -375,6 +404,6 @@ class RITEnvironment(gym.Env):
                     else:
                         order_book = order_book.append(outstanding)
             except:
-                order_book = pd.DataFrame(columns=['volume', 'side']).set_index('price')
+                order_book = pd.DataFrame(columns=['price', 'volume', 'side'])
 
         return order_book
